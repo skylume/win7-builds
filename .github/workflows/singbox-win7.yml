@@ -1,0 +1,179 @@
+name: "sing-box reF1nd · Win7"
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "版本号，如 1.14.2-reF1nd。留空则按 source_ref 自动推导"
+        required: false
+        type: string
+      source_ref:
+        description: "源码 tag，如 v1.14.2-reF1nd。留空自动取上游最新 tag"
+        required: false
+        default: ""
+        type: string
+      create_release:
+        description: "发布到 Release（测试不勾）"
+        required: true
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+env:
+  SLUG: singbox              # 项目短名，决定 tag 与产物前缀
+  SRC_REPO: reF1nd/sing-box  # 上游源码仓库
+  GO_WIN7_VERSION: ""        # 留空自动用上游最新，固定填 v1.26.4-1
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      ref: ${{ steps.src.outputs.ref }}
+      version: ${{ steps.src.outputs.version }}
+      tag: ${{ steps.src.outputs.tag }}
+    steps:
+      - name: Checkout build scripts
+        uses: actions/checkout@v5
+
+      - name: Resolve source
+        id: src
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          INPUT_REF: ${{ inputs.source_ref }}
+          INPUT_VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          ref="$INPUT_REF"
+          if [ -z "$ref" ]; then
+            ref="$(bash scripts/common/upstream.sh latest-tag "$SRC_REPO")"
+          fi
+          echo "源码 ref：$ref"
+
+          ver="$INPUT_VERSION"
+          [ -n "$ver" ] || ver="${ref#v}"
+          ver="${ver#v}"
+          if ! printf '%s' "$ver" | grep -Eq '^[0-9]+(\.[0-9]+)+(-[0-9A-Za-z.]+)?$'; then
+            echo "::error::版本号格式不合法：$ver（示例 1.14.2-reF1nd / 1.14.2-r2）"
+            exit 1
+          fi
+
+          {
+            echo "ref=$ref"
+            echo "version=$ver"
+            echo "tag=${SLUG}-v${ver}-win7"
+          } >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: prepare
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        goarch: [amd64, "386"]
+    steps:
+      - name: Checkout build scripts
+        uses: actions/checkout@v5
+
+      - name: Checkout source
+        uses: actions/checkout@v5
+        with:
+          repository: ${{ env.SRC_REPO }}
+          ref: ${{ needs.prepare.outputs.ref }}
+          fetch-depth: 1
+          path: src
+
+      - name: Resolve toolchain
+        id: toolchain
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GO_WIN7_VERSION: ${{ env.GO_WIN7_VERSION }}
+        run: bash scripts/common/go-win7.sh resolve
+
+      - name: Cache Win7 Go
+        id: cache-go
+        uses: actions/cache@v5
+        with:
+          path: ~/go_win7
+          key: go_win7_${{ steps.toolchain.outputs.tag }}
+
+      - name: Setup Win7 Go
+        if: steps.cache-go.outputs.cache-hit != 'true'
+        env:
+          GO_WIN7_URL: ${{ steps.toolchain.outputs.url }}
+          GO_WIN7_SHA256: ${{ steps.toolchain.outputs.sha256 }}
+          GO_WIN7_TAG: ${{ steps.toolchain.outputs.tag }}
+        run: bash scripts/common/go-win7.sh install
+
+      # ↓↓↓ 以下为项目特有部分 ↓↓↓
+
+      - name: Build
+        env:
+          GOOS: windows
+          GOARCH: ${{ matrix.goarch }}
+          CGO_ENABLED: "0"
+          GOTOOLCHAIN: local
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          set -euo pipefail
+          export GOROOT="$HOME/go_win7"
+          export PATH="$GOROOT/bin:$PATH"
+          go version
+          mkdir -p "$GITHUB_WORKSPACE/dist"
+          cd src
+          go build -trimpath \
+            -ldflags "-s -w -X github.com/sagernet/sing-box/constant.Version=${VERSION} -buildid=" \
+            -o "$GITHUB_WORKSPACE/dist/sing-box.exe" ./cmd/sing-box
+          cd "$GITHUB_WORKSPACE/dist"
+          zip "${SLUG}-v${VERSION}-win7-${GOARCH}.zip" sing-box.exe
+          sha256sum *.zip | awk '{print $1}' > "${SLUG}-v${VERSION}-win7-${GOARCH}.zip.sha256"
+          rm -f sing-box.exe
+
+      # ↑↑↑ 以上为项目特有部分 ↑↑↑
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v5
+        with:
+          name: ${{ env.SLUG }}-win7-${{ matrix.goarch }}
+          path: dist/*
+          retention-days: 7
+
+  release:
+    name: Publish release
+    needs: [prepare, build]
+    runs-on: ubuntu-latest
+    if: ${{ inputs.create_release }}
+    steps:
+      - name: Checkout build scripts
+        uses: actions/checkout@v5
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v5
+        with:
+          pattern: ${{ env.SLUG }}-win7-*
+          path: dist
+          merge-multiple: true
+
+      - name: Resolve toolchain (for note)
+        id: toolchain
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GO_WIN7_VERSION: ${{ env.GO_WIN7_VERSION }}
+        run: bash scripts/common/go-win7.sh resolve || echo "tag=未知" >> "$GITHUB_OUTPUT"
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.prepare.outputs.tag }}
+          name: "[sing-box reF1nd] v${{ needs.prepare.outputs.version }} · Win7"
+          body: |
+            源码：${{ env.SRC_REPO }} @ ${{ needs.prepare.outputs.ref }}
+            工具链：go-legacy-win7 ${{ steps.toolchain.outputs.tag }}
+            Windows 7 / Server 2008 R2 可用，含 amd64 与 386。
+          files: |
+            dist/*.zip
+            dist/*.sha256
+          fail_on_unmatched_files: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
