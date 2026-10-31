@@ -1,0 +1,151 @@
+name: "CFData-WEB · Win7"
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "版本号，如 1.8.5。留空则按 source_ref 自动推导"
+        required: false
+        type: string
+      source_ref:
+        description: "源码 tag / 分支，如 v1.8.5。留空自动取上游最新 tag"
+        required: false
+        default: ""
+        type: string
+      create_release:
+        description: "发布到 Release（测试不勾）"
+        required: true
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+env:
+  SLUG: cfdata                        # 项目短名，决定 tag 与产物前缀
+  SRC_REPO: PoemMisty/CFData-WEB      # 上游源码仓库
+  GO_WIN7_VERSION: ""                 # 留空自动用上游最新，固定填 v1.26.4-1
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      # 1) 先拉本仓库（打包脚本自己）
+      - name: Checkout build scripts
+        uses: actions/checkout@v5
+
+      # 2) 解析源码 tag 与版本号（checkout 之前，因为 ref 要用它）
+      - name: Resolve source
+        id: src
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          INPUT_REF: ${{ inputs.source_ref }}
+          INPUT_VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          ref="$INPUT_REF"
+          if [ -z "$ref" ]; then
+            ref="$(bash scripts/common/upstream.sh latest-tag "$SRC_REPO")"
+          fi
+          echo "源码 ref：$ref"
+
+          ver="$INPUT_VERSION"
+          [ -n "$ver" ] || ver="${ref#v}"
+          ver="${ver#v}"
+          # 只放行 数字.数字.数字 及 -xxx 后缀，避免打出脏 tag
+          if ! printf '%s' "$ver" | grep -Eq '^[0-9]+(\.[0-9]+)+(-[0-9A-Za-z.]+)?$'; then
+            echo "::error::版本号格式不合法：$ver（示例 1.8.5 / 1.8.5-r2）"
+            exit 1
+          fi
+
+          {
+            echo "ref=$ref"
+            echo "version=$ver"
+            echo "tag=${SLUG}-v${ver}-win7"
+          } >> "$GITHUB_OUTPUT"
+
+      # 3) 再拉源码，必须指定 path，否则会覆盖掉 scripts/
+      - name: Checkout source
+        uses: actions/checkout@v5
+        with:
+          repository: ${{ env.SRC_REPO }}
+          ref: ${{ steps.src.outputs.ref }}
+          fetch-depth: 1
+          path: src
+
+      - name: Resolve toolchain
+        id: toolchain
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GO_WIN7_VERSION: ${{ env.GO_WIN7_VERSION }}
+        run: bash scripts/common/go-win7.sh resolve
+
+      - name: Cache Win7 Go
+        id: cache-go
+        uses: actions/cache@v5
+        with:
+          path: ~/go_win7
+          key: go_win7_${{ steps.toolchain.outputs.tag }}
+
+      - name: Setup Win7 Go
+        if: steps.cache-go.outputs.cache-hit != 'true'
+        env:
+          GO_WIN7_URL: ${{ steps.toolchain.outputs.url }}
+          GO_WIN7_SHA256: ${{ steps.toolchain.outputs.sha256 }}
+          GO_WIN7_TAG: ${{ steps.toolchain.outputs.tag }}
+        run: bash scripts/common/go-win7.sh install
+
+      # ↓↓↓ 以下为项目特有部分 ↓↓↓
+
+      - name: Refresh CA bundle
+        run: |
+          set -euo pipefail
+          curl -fsSL --retry 3 https://curl.se/ca/cacert.pem -o src/combined_refactor/ca-certificates.crt
+
+      - name: Build
+        env:
+          GOOS: windows
+          GOARCH: amd64
+          CGO_ENABLED: "0"
+          GOTOOLCHAIN: local
+          VERSION: ${{ steps.src.outputs.version }}
+        run: |
+          set -euo pipefail
+          export GOROOT="$HOME/go_win7"
+          export PATH="$GOROOT/bin:$PATH"
+          go version
+          mkdir -p "$GITHUB_WORKSPACE/dist"
+          cd src/combined_refactor
+          go build -trimpath \
+            -ldflags "-s -w -X main.appVersion=${VERSION} -buildid=" \
+            -o "$GITHUB_WORKSPACE/dist/cfdata.exe" .
+          cd "$GITHUB_WORKSPACE/dist"
+          zip "${SLUG}-v${VERSION}-win7-amd64.zip" cfdata.exe
+          sha256sum *.zip | awk '{print $1}' > "${SLUG}-v${VERSION}-win7-amd64.zip.sha256"
+          rm -f cfdata.exe
+
+      # ↑↑↑ 以上为项目特有部分 ↑↑↑
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v5
+        with:
+          name: ${{ env.SLUG }}-win7-amd64
+          path: dist/*
+          retention-days: 7
+
+      - name: Publish release
+        if: ${{ inputs.create_release }}
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.src.outputs.tag }}
+          name: "[CFData-WEB] v${{ steps.src.outputs.version }} · Win7"
+          body: |
+            源码：${{ env.SRC_REPO }} @ ${{ steps.src.outputs.ref }}
+            工具链：go-legacy-win7 ${{ steps.toolchain.outputs.tag }}
+            Windows 7 / Server 2008 R2 可用，单文件 exe，前端已内嵌。
+          files: |
+            dist/*.zip
+            dist/*.sha256
+          fail_on_unmatched_files: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
