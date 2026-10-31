@@ -1,0 +1,38 @@
+name: 申请新增构建
+description: 希望为某个项目增加 Win7 构建，或跟进上游新版本
+title: "[构建请求] "
+labels: ["build-request"]
+body:
+  - type: markdown
+    value: |
+      请确认该项目为 **Go 语言**编写，且官方已放弃 Windows 7 支持。
+      非 Go 项目或本身仍支持 Win7 的项目无法处理。
+  - type: input
+    id: project
+    attributes:
+      label: 项目仓库地址
+      description: 例如 https://github.com/owner/repo
+      placeholder: https://github.com/owner/repo
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: 需要构建的版本 / tag
+      placeholder: v1.8.5
+    validations:
+      required: true
+  - type: input
+    id: arch
+    attributes:
+      label: 需要的架构
+      default: amd64
+    validations:
+      required: false
+  - type: textarea
+    id: extra
+    attributes:
+      label: 补充说明
+      description: 例如构建命令、模块子目录、版本注入变量名等
+    validations:
+      required: false
