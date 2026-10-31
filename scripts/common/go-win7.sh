@@ -8,13 +8,30 @@
 # 环境变量：
 #   GO_WIN7_VERSION  指定版本 tag（如 v1.26.4-1）；留空自动取上游最新
 #   GH_TOKEN         可选，给 gh 用；Actions 里传 secrets.GITHUB_TOKEN 可大幅提高 API 额度
+#   GO_WIN7_URL      产物下载地址（install 必需）
 #   GO_WIN7_SHA256   可选，手动指定哈希（覆盖自动解析）
+#   GO_WIN7_TAG      版本 tag，写入目标目录 .version 供缓存复用判断
 set -euo pipefail
 
 REPO="thongtech/go-legacy-win7"
 # runner 是 Linux，工具链必须选 linux 版；目标平台由 GOOS 决定，与工具链平台无关
 ASSET_OS="linux_amd64"
 API="repos/${REPO}/releases"
+
+# 临时目录用全局变量：函数内的 local 在 EXIT trap 触发时已被销毁，会报 unbound variable
+TMP_DIR=""
+cleanup() {
+  if [ -n "${TMP_DIR:-}" ] && [ -d "${TMP_DIR:-}" ]; then
+    rm -rf "$TMP_DIR"
+  fi
+  return 0
+}
+trap cleanup EXIT
+
+die() {
+  printf '::error::%s\n' "$*"
+  exit 1
+}
 
 # 取 release JSON：优先 gh（自带认证、额度高），失败用 curl
 fetch_json() {
@@ -55,7 +72,7 @@ cmd_resolve() {
   if [ -z "$tag" ]; then
     echo "::warning::API 不可用（可能限流），改用重定向获取版本号，本次跳过哈希校验"
     tag="$(fetch_tag_by_redirect || true)"
-    [ -n "$tag" ] && [ "$tag" != "latest" ] || { echo "::error::无法确定 go-legacy-win7 版本"; exit 1; }
+    [ -n "$tag" ] && [ "$tag" != "latest" ] || die "无法确定 go-legacy-win7 版本"
   fi
 
   ver="${tag#v}"
@@ -83,6 +100,26 @@ cmd_resolve() {
   } >> "${GITHUB_OUTPUT:-/dev/stdout}"
 }
 
+# 在解压目录里定位 GOROOT：找 bin/go，取其上一级目录
+# 注意：tarball 顶层目录是 go-legacy-win7（官方安装文档即 GOROOT=/usr/local/go-legacy-win7），
+# 因此 bin/go 位于 顶层/bin/go，深度不能用 maxdepth 2 限制，否则匹配不到。
+locate_goroot() {
+  local base="$1" cand="" root=""
+  cand="$(find "$base" -type f -path '*/bin/go' -print 2>/dev/null | sort | head -n 1 || true)"
+  [ -n "$cand" ] || return 1
+  [ -f "$cand" ] || return 1
+
+  root="$(dirname "$(dirname "$cand")")"
+  # 必须仍在解压目录内，避免 dirname 拿到相对路径 "." 之类
+  case "$root" in
+    "$base"/*) ;;
+    *) return 1 ;;
+  esac
+  [ -f "$root/bin/go" ] || return 1
+
+  printf '%s' "$root"
+}
+
 cmd_install() {
   local DEST="${1:-$HOME/go_win7}"
   local URL="${GO_WIN7_URL:?需要 GO_WIN7_URL}"
@@ -92,36 +129,42 @@ cmd_install() {
   if [ -f "$DEST/.version" ] && [ "$(cat "$DEST/.version")" = "$TAG" ] && [ -x "$DEST/bin/go" ]; then
     echo "工具链已是 $TAG，跳过安装"
     "$DEST/bin/go" version
-    exit 0
+    return 0
   fi
 
-  local tmp
-  tmp="$(mktemp -d)"
-  trap 'rm -rf "$tmp"' EXIT
+  TMP_DIR="$(mktemp -d)"
   echo "下载 $URL"
-  curl -fsSL --retry 3 --connect-timeout 15 -o "$tmp/go.tgz" "$URL"
+  curl -fsSL --retry 3 --connect-timeout 15 -o "$TMP_DIR/go.tgz" "$URL"
+  [ -s "$TMP_DIR/go.tgz" ] || die "下载为空：$URL"
 
   if [ -n "$SHA" ]; then
     echo "校验 SHA-256 ..."
-    echo "$SHA  $tmp/go.tgz" | sha256sum -c -
+    echo "$SHA  $TMP_DIR/go.tgz" | sha256sum -c -
   fi
 
-  mkdir -p "$tmp/unpack"
-  tar -xzf "$tmp/go.tgz" -C "$tmp/unpack"
+  mkdir -p "$TMP_DIR/unpack"
+  tar -xzf "$TMP_DIR/go.tgz" -C "$TMP_DIR/unpack"
 
-  local root
-  root="$(dirname "$(find "$tmp/unpack" -maxdepth 2 -type f -path '*/bin/go' | head -n 1)")"
-  [ -n "$root" ] || { echo "::error::压缩包里没找到 bin/go"; exit 1; }
+  echo "压缩包顶层结构："
+  find "$TMP_DIR/unpack" -maxdepth 1 -mindepth 1 | sed 's/^/  /'
+
+  local root=""
+  root="$(locate_goroot "$TMP_DIR/unpack")" \
+    || die "压缩包里没找到 bin/go，结构可能变了，请检查上面的顶层结构"
+
+  echo "GOROOT：$root"
 
   rm -rf "$DEST"
   mkdir -p "$DEST"
   cp -a "$root/." "$DEST/"
+  chmod +x "$DEST/bin/go" 2>/dev/null || true
+  [ -x "$DEST/bin/go" ] || die "安装后 $DEST/bin/go 仍不存在"
   echo "$TAG" > "$DEST/.version"
   "$DEST/bin/go" version
 }
 
 case "${1:-}" in
   resolve) cmd_resolve ;;
-  install) shift; cmd_install "$@" ;;
+  install) shift; cmd_install "$@"; exit 0 ;;
   *) echo "用法：$0 {resolve|install} [目标目录]" >&2; exit 1 ;;
 esac
